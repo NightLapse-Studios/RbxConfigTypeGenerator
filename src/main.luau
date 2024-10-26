@@ -2,10 +2,11 @@
 
 local CONFIG = {
 	-- Reserialize the API dump to dump.json
-	WriteDumpToFile = false,
+	WriteDumpToFile = true,
 	-- Suffix for generated types to avoid collisions
 	TypeSuffix = "Cfg",
-	IgnoreDeprecatedMembers = true
+	IgnoreDeprecatedMembers = true,
+	IgnoreDeprecatedClasses = true
 }
 
 local fs = require("@lune/fs")
@@ -85,6 +86,7 @@ local PRIMITIVE_MAP = {
 	["string?"] = "string?",
 	["null"] = "()"
 }
+
 local GROUP_MAP = {
 	Array = "{ [number]: any }",
 	["Array?"] = "{ [number]: any }?",
@@ -185,21 +187,30 @@ local function member_to_luau_type(member: APITypes.Member): string?
 	return "\t" .. member.Name .. ": " .. rhs
 end
 
-
+-- Primary useful function
 local function dump_luau_types()
-	print(string.format(TYPES_HEADER, RbxVersion))
-
 	local ClassLookup = { }
 
 	for i,v in API.Classes do
 		ClassLookup[v.Name .. CONFIG.TypeSuffix] = v
 	end
 
+	-- Strip classes that make no sense to configure
+	-- atm this is just services
+	local ClassesAfterStripping = { }
 	for i,v in API.Classes do
 		if has_tag(v, "Service") then
 			continue
 		end
 
+		table.insert(ClassesAfterStripping, v)
+	end
+
+	-- Begin printing the file
+	print(string.format(TYPES_HEADER, RbxVersion))
+
+	-- Print individual classes
+	for i,v in ClassesAfterStripping do
 		local members = ""
 		for _, m in v.Members do
 			local t = member_to_luau_type(m)
@@ -216,9 +227,31 @@ local function dump_luau_types()
 		local out_class = `export type {v.Name .. CONFIG.TypeSuffix} = {superclass}\{\n{members}\}\n`
 		print(out_class)
 	end
+
+	-- Export a type that describes a function which takes a string
+	-- and returns a function which takes an configuration for that specific class
+	-- then returns that instance class.
+	-- This type is in line with what Vide uses for Vide.create
+	print("export type InstanceConfigureFactory =")
+	for i = 1, #ClassesAfterStripping, 1 do
+		local v = ClassesAfterStripping[i]
+		if has_tag(v, "NotCreatable") then
+			continue
+		elseif CONFIG.IgnoreDeprecatedClasses and has_tag(v, "Deprecated") then
+			continue
+		end
+
+		local s = `(("{v.Name}") -> ({v.Name .. CONFIG.TypeSuffix}) -> {v.Name})`
+
+		if i < #ClassesAfterStripping then
+			s ..= " &"
+		end
+
+		print(s)
+	end
 end
 
-
+-- Debug function
 local function dump_ValueTypes()
 	local Output = { }
 	local Collisions = { }
@@ -238,6 +271,7 @@ local function dump_ValueTypes()
 	print(Collisions)
 end
 
+-- Debug function
 local function dump_ValueTypes_by_category()
 	local Output = { }
 
@@ -253,6 +287,7 @@ local function dump_ValueTypes_by_category()
 	print(Output)
 end
 
+-- Generally used for debugging, better than printing because of table nesting truncation
 if CONFIG.WriteDumpToFile then
 	fs.writeFile("dump.json", serde.encode("json", API, true))
 end
