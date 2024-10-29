@@ -1,5 +1,5 @@
-./fetch_cache
-./fetch_cache/*
+/fetch_cache
+/fetch_cache/*
 out.luau
 dump.json
 *.txt
