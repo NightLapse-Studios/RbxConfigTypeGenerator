@@ -1,12 +1,18 @@
 --!strict
 
 local CONFIG = {
-	-- Reserialize the API dump to dump.json
-	WriteDumpToFile = true,
 	-- Suffix for generated types to avoid collisions
 	TypeSuffix = "Cfg",
 	IgnoreDeprecatedMembers = true,
-	IgnoreDeprecatedClasses = true
+	IgnoreDeprecatedClasses = true,
+	GenerateTypesFile = true,
+	-- Does a second pass that outputs a list of types associated
+	-- with each particular member string
+	AmbiguousMembersHelperFile = "combined_members.txt",
+	-- Reserialize the API dump to dump.json
+	APIFetchDumpFile = false,
+	-- Bypass fetching with this file instead
+	APIFetchCacheFile = true
 }
 
 local fs = require("@lune/fs")
@@ -29,6 +35,13 @@ type OptionalCoordinateFrame = CFrame?
 type Objects = { Instance }
 ]]
 
+local BAD_SECURITIES = {
+	RobloxScriptSecurity = true,
+	CoreScript = true,
+	Plugin = true,
+}
+
+
 local function get_rbx_version(): string
 	local res = net.request({
 		url = GET_VERSION_URL,
@@ -49,16 +62,55 @@ local function get_api(version): APITypes.API
 	return serde.decode("json", res.body)
 end
 
+local RbxVersion: string = get_rbx_version()
+local API: APITypes.API
+local ClassLookup: { [string]: APITypes.Class } = { }
+local SubclassList: { [string]: { APITypes.Class }? } = { }
 
-local RbxVersion = get_rbx_version()
-local API = get_api(RbxVersion)
-assert(API.Version == 1, "API Version is not 1")
+do
+	if CONFIG.APIFetchCacheFile then
+		local cache_dir_exists = fs.isDir("fetch_cache")
+		if not cache_dir_exists then
+			error("Fetch cache enabled but no cache directory exists\nPlease navigate to a suitable CWD and create `fetch_cache` directory\n\t(this is not done automatically to avoid over-engineering a standard cache location)")
+		end
 
-local BAD_SECURITIES = {
-	RobloxScriptSecurity = true,
-	CoreScript = true,
-	Plugin = true,
-}
+		local cur_cache_file = `fetch_cache/{RbxVersion}.json`
+		local cache_exists = fs.isFile(cur_cache_file)
+		if cache_exists then
+			API = serde.decode("json", fs.readFile(cur_cache_file))
+		else
+			for i,v in fs.readDir("fetch_cache") do
+				fs.removeFile("fetch_cache/" .. v)
+			end
+
+			API = get_api(RbxVersion)
+			fs.writeFile(cur_cache_file, serde.encode("json", API, true))
+		end
+	else
+		API = get_api(RbxVersion)
+	end
+
+	assert(API.Version == 1, "API Version is not 1")
+	
+	-- do some preprocessing so that culling classes can cull non-creatable ones which are
+	-- only inherited by non-creatable ones
+	for i,v in API.Classes do
+		ClassLookup[v.Name .. CONFIG.TypeSuffix] = v
+	end
+
+	for i,v in API.Classes do
+		if not v.Superclass then continue end
+
+		local super_name = v.Superclass .. CONFIG.TypeSuffix
+		SubclassList[super_name] = SubclassList[super_name] or { }
+		local list = SubclassList[super_name]
+		assert(list)
+
+		table.insert(list, v)
+	end
+end
+
+
 
 local function has_bad_security(m: APITypes.Member): boolean
 	if m.MemberType == "Property" then
@@ -157,19 +209,8 @@ local function callback_to_luau_type(callback: APITypes.Callback): string
 	return params .. " -> (" .. ret .. "),"
 end
 
--- Returns the type of a member with field name and trailing comma
-local function member_to_luau_type(member: APITypes.Member): string?
-	if has_bad_security(member) then
-		return nil
-	end
-
-	if has_tag(member, "NotScriptable") then
-		return nil
-	elseif CONFIG.IgnoreDeprecatedMembers and has_tag(member, "Deprecated") then
-		return nil
-	end
-
-	local rhs
+local function member_rhs(member: APITypes.Member): string?
+	local rhs = nil
 	if member.MemberType == "Property" then
 		if has_tag(member, "ReadOnly") then
 			return nil
@@ -184,30 +225,119 @@ local function member_to_luau_type(member: APITypes.Member): string?
 		return nil
 	end
 
+	return rhs
+end
+
+local function member_is_configurable(member: APITypes.Member): boolean
+	if has_bad_security(member) then
+		return false
+	end
+
+	if has_tag(member, "NotScriptable") or has_tag(member, "ReadOnly") then
+		return false
+	elseif CONFIG.IgnoreDeprecatedMembers and has_tag(member, "Deprecated") then
+		return false
+	end
+
+	return true
+end
+
+-- Returns the type of a member with field name and trailing comma
+local function member_to_luau_type(member: APITypes.Member): string?
+	if not member_is_configurable(member) then
+		return nil
+	end
+
+	local rhs = member_rhs(member)
+	if not rhs then
+		return nil
+	end
+
 	return "\t" .. member.Name .. ": " .. rhs
 end
 
--- Primary useful function
-local function dump_luau_types()
-	local ClassLookup = { }
+local function class_group_is_creatable(c: APITypes.Class): boolean
+	if has_tag(c, "NotCreatable") then
+		local name = c.Name .. CONFIG.TypeSuffix
+		if SubclassList[name] then
 
-	for i,v in API.Classes do
-		ClassLookup[v.Name .. CONFIG.TypeSuffix] = v
+			local has_creatable_subclass
+			for i,v in SubclassList[name] do
+				if has_tag(v, "NotCreatable") then
+					has_creatable_subclass = class_group_is_creatable(ClassLookup[v.Name .. CONFIG.TypeSuffix])
+					if has_creatable_subclass then
+						break
+					end
+				else
+					has_creatable_subclass = true
+					break
+				end
+			end
+
+			if not has_creatable_subclass then
+				return false
+			end
+		else
+			return false
+		end
 	end
 
-	-- Strip classes that make no sense to configure
-	-- atm this is just services
-	local ClassesAfterStripping = { }
+	return true
+end
+
+local function class_group_has_members(c: APITypes.Class): boolean
+	if #c.Members ~= 0 then
+		for i,v in c.Members do
+			if member_is_configurable(v) then
+				return true
+			end
+		end
+	end
+
+	local subclasses = SubclassList[c.Name .. CONFIG.TypeSuffix]
+	if not subclasses then
+		return false
+	end
+
+	for i,v in subclasses do
+		if class_group_has_members(v) then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function cull_classes(api: APITypes.API)
+	local Stripped = { }
+
 	for i,v in API.Classes do
-		if has_tag(v, "Service") then
+		if has_tag(v, "Service") or has_tag(v, "Settings") then
 			continue
 		end
 
-		table.insert(ClassesAfterStripping, v)
+		if not class_group_has_members(v) then
+			continue
+		end
+
+		if not class_group_is_creatable(v) then
+			continue
+		end
+
+		table.insert(Stripped, v)
 	end
 
+	return Stripped
+end
+
+-- Primary useful function
+local function generate_types()
+	-- Strip classes that make no sense to configure
+	-- atm this is just services
+	local ClassesAfterStripping = cull_classes(API)
+
 	-- Begin printing the file
-	print(string.format(TYPES_HEADER, RbxVersion))
+	local out = string.format(TYPES_HEADER, RbxVersion)
 
 	-- Print individual classes
 	for i,v in ClassesAfterStripping do
@@ -225,14 +355,14 @@ local function dump_luau_types()
 		local superclass = if ClassLookup[superclass_name] then superclass_name .. " & " else ""
 
 		local out_class = `export type {v.Name .. CONFIG.TypeSuffix} = {superclass}\{\n{members}\}\n`
-		print(out_class)
+		out ..= out_class
 	end
 
 	-- Export a type that describes a function which takes a string
 	-- and returns a function which takes an configuration for that specific class
 	-- then returns that instance class.
 	-- This type is in line with what Vide uses for Vide.create
-	print("export type InstanceConfigureFactory =")
+	out ..= "export type InstanceConfigureFactory ="
 	for i = 1, #ClassesAfterStripping, 1 do
 		local v = ClassesAfterStripping[i]
 		if has_tag(v, "NotCreatable") then
@@ -244,11 +374,69 @@ local function dump_luau_types()
 		local s = `(("{v.Name}") -> ({v.Name .. CONFIG.TypeSuffix}) -> {v.Name})`
 
 		if i < #ClassesAfterStripping then
-			s ..= " &"
+			s ..= " &\n"
 		end
 
-		print(s)
+		out ..= s
 	end
+
+	return out
+end
+
+
+-- Tells which types can be associated with member names
+-- if we did not know what class was being handled
+-- Output is just text meant for human reading
+local function combine_member_types()
+	local Stripped = cull_classes(API)
+	local Members = { }
+
+	for i,v in Stripped do
+		for _, m in v.Members do
+			Members[m.Name] = Members[m.Name] or { }
+			local list = Members[m.Name]
+			
+			local t = member_rhs(m)
+
+			local found = false
+			for i,v in list do
+				if v == t then
+					found = true
+					break
+				end
+			end
+
+			if found then
+				continue
+			end
+
+			if t then
+				table.insert(list, t)
+			end
+		end
+	end
+
+	local member_ct = 0
+	local out = ""
+
+	for i,v in Members do
+		if #v == 0 then
+			continue
+		end
+
+		member_ct += 1
+		out ..= `{i} = \{\n`
+
+		for _, t in v do
+			out ..= "\t" .. t .. "\n"
+		end
+
+		out ..= "}\n\n"
+	end
+
+	print("Total members: ", member_ct)
+
+	return out
 end
 
 -- Debug function
@@ -287,10 +475,15 @@ local function dump_ValueTypes_by_category()
 	print(Output)
 end
 
--- Generally used for debugging, better than printing because of table nesting truncation
-if CONFIG.WriteDumpToFile then
-	fs.writeFile("dump.json", serde.encode("json", API, true))
+
+
+if typeof(CONFIG.AmbiguousMembersHelperFile) == "string" then
+	fs.writeFile(CONFIG.AmbiguousMembersHelperFile, combine_member_types())
+	print("Wrote member types helper file to", CONFIG.AmbiguousMembersHelperFile)
 end
 
+if typeof(CONFIG.GenerateTypesFile) then
+	fs.writeFile("out.luau", generate_types())
+	print("Wrote types file to out.luau")
+end
 
-dump_luau_types()
