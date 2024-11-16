@@ -1606,7 +1606,6 @@ local function main(args: { string })
         end
 
 	if args2.help then
-                print(args)
 		print([[Generate types (or other things) based on roblox API dump
 	help				Print this message and ignore other flags
 
