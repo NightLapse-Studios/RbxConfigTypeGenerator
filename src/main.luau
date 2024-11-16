@@ -1345,7 +1345,7 @@ local %* = {
 	return s
 end
 
-local function generate_propset_setters(leaf_classes: { APITypes.Class })
+local function generate_propset_setters(leaf_classes: { [string]: APITypes.Class })
 	local generated_setters = { }
 	local setter_funcs = ""
 	for i, leaf_class in leaf_classes do
@@ -1415,8 +1415,6 @@ local function generate_propsets()
                 props = { }
         }, propset)
 end]]
-
-
 
 	local out = header .. "\n"
 	out ..= setter_funcs .. "\n"
@@ -1584,6 +1582,7 @@ local possible_args = {
         dump_ambiguous_members = true,
         dump_api_fetch = true,
         ignore_cache_api_fetch = true,
+        help = true,
 }
 
 local function main(args: { string })
@@ -1591,19 +1590,19 @@ local function main(args: { string })
         local has_invalid_args = false
 	for i,v in args do
 		args2[v] = true
-                if not possible_args[v] then
-                        has_invalid_args = true
-                        warn("Unknown arg `" .. v .. "`")
-                end
+			if not possible_args[v] then
+				has_invalid_args = true
+				warn("Unknown arg `" .. v .. "`")
+			end
 	end
 	
 	if not fs.isDir("out/") then
 		fs.writeDir("out/")
 	end
 
-        if has_invalid_args then
-                process.exit(1)
-        end
+	if has_invalid_args then
+		process.exit(1)
+	end
 
 	if args2.help then
 		print([[Generate types (or other things) based on roblox API dump
@@ -1654,11 +1653,11 @@ Options:
 
 	if args2.gen_instance_cfgs then
 		fs.writeFile("out/InstanceCfgs.luau", generate_types())
-                print("Wrote Cfg types to InstanceCfgs.luau")
+		print("Wrote Cfg types to InstanceCfgs.luau")
 	end
 	if args2.gen_propsets then
 		fs.writeFile("out/PropSet.luau", generate_propsets())
-                print("Wrote PropSet to PropSet.luau")
+		print("Wrote PropSet to PropSet.luau")
 	end
 end
 
